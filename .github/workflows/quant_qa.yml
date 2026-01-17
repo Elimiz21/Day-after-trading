@@ -1,0 +1,58 @@
+name: Quant QA Gate (OpenAI)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run local QA checks (fast)
+        run: |
+          python -m src.qa.run_qa --mode ci
+
+      - name: Build QA bundle for OpenAI review
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          python -m src.qa.build_qa_bundle --out docs/qa_bundle/latest
+
+      - name: OpenAI QA review (Responses API)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          python scripts/openai_pr_qa_review.py \
+            --bundle docs/qa_bundle/latest \
+            --prompt config/openai_qa_prompt.md \
+            --out docs/qa_bundle/latest/openai_review.md
+
+      - name: Post (or update) PR comment with QA verdict
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-file: docs/qa_bundle/latest/openai_review.md
+          edit-mode: replace

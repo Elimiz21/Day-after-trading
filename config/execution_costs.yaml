@@ -1,0 +1,16 @@
+# Execution cost scenarios (explicit assumptions; not empirical bid/ask)
+# Costs are applied per side (entry + exit).
+
+scenarios:
+  low:
+    spread_bps_each_side: 2
+    slippage_bps_each_side: 2
+    commission_bps_each_side: 0
+  medium:
+    spread_bps_each_side: 5
+    slippage_bps_each_side: 5
+    commission_bps_each_side: 0
+  high:
+    spread_bps_each_side: 10
+    slippage_bps_each_side: 10
+    commission_bps_each_side: 0
