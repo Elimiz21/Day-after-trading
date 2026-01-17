@@ -1,32 +1,47 @@
-"""Phase 1: Smoke Test Pipeline
+"""Phase 1: Smoke Test Pipeline - End-to-End Backtest
 
-This module implements the Phase 1 smoke test:
-- Pull S&P 500 constituents sample (5 tickers)
-- Pull ~20 earnings events from FMP
-- Pull daily OHLCV for T0/T1/T2
-- Compute R1 and Gap2 features
-- Export all CSVs
+This module implements the Phase 1 smoke test as a minimal end-to-end
+backtest that implements the full strategy specification:
+
+1. Data ingestion: Earnings dates + OHLCV from FMP API
+2. Event mapping: T0/T1/T2 with session handling (BMO/AMC)
+3. Signal generation: Significant move filter on R1
+4. Trade entry: Enter at Open(T2) if signal + opposite Gap2
+5. Hit detection: Check if target (Close(T1)) hit using T2 High/Low
+6. Exit rules: Exit at target if hit, else at Close(T2)
+7. Cost modeling: Apply scenario-based execution costs
+8. P&L computation: Gross and net returns
 
 Ticker Selection Criteria (Phase 1):
 -------------------------------------
-We select 5 tickers from different sectors to ensure diversity:
+5 tickers from different sectors for diversity:
 1. AAPL (Technology) - High liquidity, frequent earnings
 2. JPM (Financials) - Major bank, different earnings cycle
 3. JNJ (Healthcare) - Defensive stock, stable earnings
 4. XOM (Energy) - Commodity-linked, volatile around earnings
 5. WMT (Consumer Defensive) - Retail sector, different seasonality
 
-These represent major sectors and have sufficient liquidity.
-All are confirmed S&P 500 members.
+Data Policy:
+------------
+- OHLCV: FMP /stable/historical-price-eod/full (split-adjusted, NOT dividend-adjusted)
+- R1/Gap2 computed from adjusted closes for consistency
+- All signals and P&L use the same adjustment policy
+
+BMO/AMC Limitation:
+-------------------
+FMP API does not provide announcement time. All events are treated as
+AMC (after market close) which is the most common case. This is tracked
+in the 'session' field for sensitivity analysis.
 """
 
-from datetime import date, timedelta
+import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import yaml
 
-from src.ingestion import FMPClient, TradingCalendar
+from src.ingestion import EarningsSession, FMPClient, TradingCalendar
 
 # Phase 1 selected tickers with rationale
 PHASE1_TICKERS = {
@@ -38,38 +53,54 @@ PHASE1_TICKERS = {
 }
 
 EXPORT_DIR = Path("data/exports/csv")
+CONFIG_DIR = Path("config")
+
+
+def load_config():
+    """Load configuration files."""
+    with open(CONFIG_DIR / "significance.yaml") as f:
+        significance = yaml.safe_load(f)
+    with open(CONFIG_DIR / "execution_costs.yaml") as f:
+        costs = yaml.safe_load(f)
+    return significance, costs
 
 
 class Phase1Pipeline:
-    """Phase 1 smoke test pipeline."""
+    """Phase 1 end-to-end backtest pipeline."""
 
     def __init__(self):
         self.fmp = FMPClient()
         self.calendar = TradingCalendar()
         self.tickers = list(PHASE1_TICKERS.keys())
+        self.significance_config, self.cost_config = load_config()
 
         # Data containers
         self.sp500_constituents: Optional[pd.DataFrame] = None
         self.earnings_events: Optional[pd.DataFrame] = None
         self.daily_ohlcv: Optional[pd.DataFrame] = None
         self.event_windows: Optional[pd.DataFrame] = None
-        self.features: Optional[pd.DataFrame] = None
+        self.signals: Optional[pd.DataFrame] = None
+        self.trades: Optional[pd.DataFrame] = None
 
         # Stats for QA
         self.stats = {
             "selected_tickers": self.tickers,
             "ticker_rationale": PHASE1_TICKERS,
             "total_earnings_events": 0,
+            "events_with_unknown_session": 0,
             "missing_t0": 0,
             "missing_t1": 0,
             "missing_t2": 0,
             "complete_windows": 0,
+            "signals_generated": 0,
+            "trades_executed": 0,
+            "trades_hit_target": 0,
         }
 
     def run(self) -> dict:
         """Execute full Phase 1 pipeline."""
         print("=" * 60)
-        print("PHASE 1: Smoke Test Pipeline")
+        print("PHASE 1: End-to-End Backtest Pipeline")
         print("=" * 60)
 
         self._step1_fetch_sp500()
@@ -77,7 +108,9 @@ class Phase1Pipeline:
         self._step3_fetch_ohlcv()
         self._step4_build_event_windows()
         self._step5_compute_features()
-        self._step6_export_csvs()
+        self._step6_generate_signals()
+        self._step7_simulate_trades()
+        self._step8_export_csvs()
 
         print("\n" + "=" * 60)
         print("Phase 1 Complete!")
@@ -89,8 +122,6 @@ class Phase1Pipeline:
     def _step1_fetch_sp500(self):
         """Fetch S&P 500 constituents sample."""
         print("\n[Step 1] Creating S&P 500 constituents sample...")
-        # Note: /stable/sp500-constituent requires higher tier subscription
-        # For Phase 1, we use hardcoded sample of our selected tickers
         self.sp500_constituents = self.fmp.get_sp500_constituents_sample(self.tickers)
         print(f"  Created sample with {len(self.sp500_constituents)} constituents")
         for _, row in self.sp500_constituents.iterrows():
@@ -109,32 +140,34 @@ class Phase1Pipeline:
                 df = df[df["epsActual"].notna()]
                 all_earnings.append(df)
                 print(f"    Found {len(df)} historical earnings events")
-            else:
-                print(f"    WARNING: No earnings data for {ticker}")
 
         if all_earnings:
             self.earnings_events = pd.concat(all_earnings, ignore_index=True)
-            # Sort by date descending to get most recent
             self.earnings_events = self.earnings_events.sort_values(
                 "date", ascending=False
             ).reset_index(drop=True)
+
+            # Add session field - UNKNOWN since FMP doesn't provide it
+            self.earnings_events["session"] = EarningsSession.UNKNOWN.value
+            self.stats["events_with_unknown_session"] = len(self.earnings_events)
         else:
             self.earnings_events = pd.DataFrame()
 
         self.stats["total_earnings_events"] = len(self.earnings_events)
         print(f"\n  Total earnings events: {len(self.earnings_events)}")
+        print(f"  Events with unknown session (BMO/AMC): {self.stats['events_with_unknown_session']}")
 
     def _step3_fetch_ohlcv(self):
-        """Fetch daily OHLCV data for all dates needed."""
+        """Fetch daily OHLCV data."""
         print("\n[Step 3] Fetching daily OHLCV data...")
+        print("  Note: Using FMP split-adjusted prices (not dividend-adjusted)")
 
         if self.earnings_events.empty:
-            print("  ERROR: No earnings events to fetch OHLCV for")
+            print("  ERROR: No earnings events")
             return
 
-        # Determine date range needed (with buffer for T0/T1/T2)
-        min_date = self.earnings_events["date"].min() - timedelta(days=10)
-        max_date = self.earnings_events["date"].max() + timedelta(days=10)
+        min_date = self.earnings_events["date"].min() - pd.Timedelta(days=90)
+        max_date = self.earnings_events["date"].max() + pd.Timedelta(days=10)
 
         all_ohlcv = []
         for ticker in self.tickers:
@@ -147,8 +180,6 @@ class Phase1Pipeline:
             if not df.empty:
                 all_ohlcv.append(df)
                 print(f"    Got {len(df)} trading days")
-            else:
-                print(f"    WARNING: No OHLCV data for {ticker}")
 
         if all_ohlcv:
             self.daily_ohlcv = pd.concat(all_ohlcv, ignore_index=True)
@@ -158,37 +189,36 @@ class Phase1Pipeline:
         print(f"\n  Total OHLCV rows: {len(self.daily_ohlcv)}")
 
     def _step4_build_event_windows(self):
-        """Build T0/T1/T2 windows for each earnings event."""
+        """Build T0/T1/T2 windows with session-aware mapping."""
         print("\n[Step 4] Building event windows (T0/T1/T2)...")
+        print("  Using AMC (after market close) assumption for all events")
 
         if self.earnings_events.empty or self.daily_ohlcv.empty:
-            print("  ERROR: Missing earnings or OHLCV data")
+            print("  ERROR: Missing data")
             return
 
-        # Create lookup for OHLCV by (symbol, date)
+        # Create OHLCV lookup
         ohlcv_lookup = {}
         for _, row in self.daily_ohlcv.iterrows():
             key = (row["symbol"], row["date"].date())
             ohlcv_lookup[key] = row
 
         windows = []
-        missing_t0 = 0
-        missing_t1 = 0
-        missing_t2 = 0
+        missing_t0 = missing_t1 = missing_t2 = 0
 
         for _, event in self.earnings_events.iterrows():
             symbol = event["symbol"]
             earnings_date = event["date"].date()
+            session = EarningsSession(event["session"])
 
-            # Get T0/T1/T2 dates
-            t_dates = self.calendar.get_t0_t1_t2(earnings_date)
+            # Get T0/T1/T2 with session handling
+            t_dates = self.calendar.get_t0_t1_t2(earnings_date, session)
 
-            # Look up OHLCV for each date
+            # Look up OHLCV
             t0_data = ohlcv_lookup.get((symbol, t_dates["t0"]))
             t1_data = ohlcv_lookup.get((symbol, t_dates["t1"]))
             t2_data = ohlcv_lookup.get((symbol, t_dates["t2"]))
 
-            # Track missing data
             if t0_data is None:
                 missing_t0 += 1
             if t1_data is None:
@@ -199,6 +229,8 @@ class Phase1Pipeline:
             window = {
                 "symbol": symbol,
                 "earnings_date": earnings_date,
+                "session": t_dates["session"],
+                "effective_session": t_dates["effective_session"],
                 "t0_date": t_dates["t0"],
                 "t1_date": t_dates["t1"],
                 "t2_date": t_dates["t2"],
@@ -225,10 +257,14 @@ class Phase1Pipeline:
 
         self.event_windows = pd.DataFrame(windows)
 
-        # Count complete windows (all T0/T1/T2 have data)
-        complete = self.event_windows.dropna(
-            subset=["t0_close", "t1_close", "t2_close"]
-        )
+        # Validation: t0 <= t1 < t2
+        valid = self.event_windows.dropna(subset=["t0_date", "t1_date", "t2_date"])
+        date_order_ok = (
+            (valid["t0_date"] <= valid["t1_date"]) &
+            (valid["t1_date"] < valid["t2_date"])
+        ).all()
+
+        complete = self.event_windows.dropna(subset=["t0_close", "t1_close", "t2_close", "t2_open"])
 
         self.stats["missing_t0"] = missing_t0
         self.stats["missing_t1"] = missing_t1
@@ -236,106 +272,266 @@ class Phase1Pipeline:
         self.stats["complete_windows"] = len(complete)
 
         print(f"  Total event windows: {len(self.event_windows)}")
-        print(f"  Complete windows (T0+T1+T2): {len(complete)}")
+        print(f"  Complete windows: {len(complete)}")
         print(f"  Missing T0: {missing_t0}, T1: {missing_t1}, T2: {missing_t2}")
+        print(f"  Date ordering valid (t0 <= t1 < t2): {date_order_ok}")
 
     def _step5_compute_features(self):
         """Compute R1 and Gap2 features."""
-        print("\n[Step 5] Computing core features (R1, Gap2)...")
+        print("\n[Step 5] Computing features (R1, Gap2)...")
 
         if self.event_windows is None or self.event_windows.empty:
-            print("  ERROR: No event windows to compute features")
             return
 
-        df = self.event_windows.copy()
+        df = self.event_windows
 
-        # R1 = Close(T1) / Close(T0) - 1
+        # R1 = Close(T1) / Close(T0) - 1 (day-after return)
         df["R1"] = df["t1_close"] / df["t0_close"] - 1
 
-        # Gap2 = Open(T2) / Close(T1) - 1
+        # Gap2 = Open(T2) / Close(T1) - 1 (overnight gap into T2)
         df["Gap2"] = df["t2_open"] / df["t1_close"] - 1
 
-        self.features = df[
-            [
-                "symbol",
-                "earnings_date",
-                "t0_date",
-                "t1_date",
-                "t2_date",
-                "t0_close",
-                "t1_close",
-                "t2_open",
-                "R1",
-                "Gap2",
-            ]
-        ].copy()
+        # Absolute values for filtering
+        df["abs_R1"] = df["R1"].abs()
+        df["abs_Gap2"] = df["Gap2"].abs()
 
-        # Stats on computed features
         valid_r1 = df["R1"].notna().sum()
         valid_gap2 = df["Gap2"].notna().sum()
 
         self.stats["valid_r1_count"] = int(valid_r1)
         self.stats["valid_gap2_count"] = int(valid_gap2)
 
-        print(f"  Valid R1 values: {valid_r1}")
-        print(f"  Valid Gap2 values: {valid_gap2}")
-
         if valid_r1 > 0:
-            r1_mean = df["R1"].mean()
-            r1_std = df["R1"].std()
-            self.stats["r1_mean"] = float(r1_mean)
-            self.stats["r1_std"] = float(r1_std)
-            print(f"  R1 mean: {r1_mean:.4f}, std: {r1_std:.4f}")
+            self.stats["r1_mean"] = float(df["R1"].mean())
+            self.stats["r1_std"] = float(df["R1"].std())
+            print(f"  R1: mean={df['R1'].mean():.4f}, std={df['R1'].std():.4f}")
         if valid_gap2 > 0:
-            gap2_mean = df["Gap2"].mean()
-            gap2_std = df["Gap2"].std()
-            self.stats["gap2_mean"] = float(gap2_mean)
-            self.stats["gap2_std"] = float(gap2_std)
-            print(f"  Gap2 mean: {gap2_mean:.4f}, std: {gap2_std:.4f}")
+            self.stats["gap2_mean"] = float(df["Gap2"].mean())
+            self.stats["gap2_std"] = float(df["Gap2"].std())
+            print(f"  Gap2: mean={df['Gap2'].mean():.4f}, std={df['Gap2'].std():.4f}")
 
-    def _step6_export_csvs(self):
+    def _step6_generate_signals(self):
+        """Generate trading signals based on significant move filter."""
+        print("\n[Step 6] Generating signals...")
+
+        if self.event_windows is None or self.event_windows.empty:
+            return
+
+        df = self.event_windows.copy()
+
+        # Use minimum threshold from config for Phase 1
+        # abs_R1 > 1% is a "significant move"
+        r1_threshold = 0.01  # 1%
+        gap2_min = self.significance_config.get("gap2_min_abs", {}).get("thresholds", [0.0025])[0]
+
+        print(f"  R1 threshold (absolute): {r1_threshold:.2%}")
+        print(f"  Gap2 minimum (absolute): {gap2_min:.4f}")
+
+        # Signal logic:
+        # - Significant negative R1 (big drop on T1) + positive Gap2 -> LONG
+        # - Significant positive R1 (big rise on T1) + negative Gap2 -> SHORT
+        # - Otherwise -> NO_TRADE
+
+        signals = []
+        for idx, row in df.iterrows():
+            if pd.isna(row["R1"]) or pd.isna(row["Gap2"]):
+                signal = "NO_DATA"
+            elif row["abs_R1"] < r1_threshold:
+                signal = "NO_TRADE_SMALL_R1"
+            elif row["abs_Gap2"] < gap2_min:
+                signal = "NO_TRADE_SMALL_GAP"
+            elif row["R1"] < 0 and row["Gap2"] > 0:
+                # Big drop, then gap up -> expect reversal down, SHORT
+                # Wait, strategy is: if big drop, expect bounce -> LONG
+                # Let me re-read: "day-after reversal" = price reverses after big move
+                # Big drop on T1 -> expect price to bounce -> LONG on T2
+                signal = "LONG"
+            elif row["R1"] > 0 and row["Gap2"] < 0:
+                # Big rise, then gap down -> expect reversal -> SHORT
+                signal = "SHORT"
+            else:
+                # Gap direction same as R1, no reversal signal
+                signal = "NO_TRADE_SAME_DIRECTION"
+
+            signals.append({
+                "event_idx": idx,
+                "symbol": row["symbol"],
+                "earnings_date": row["earnings_date"],
+                "t2_date": row["t2_date"],
+                "R1": row["R1"],
+                "Gap2": row["Gap2"],
+                "signal": signal,
+                "target_price": row["t1_close"],  # Target = Close(T1)
+                "entry_price": row["t2_open"],    # Entry = Open(T2)
+                "t2_high": row["t2_high"],
+                "t2_low": row["t2_low"],
+                "t2_close": row["t2_close"],
+            })
+
+        self.signals = pd.DataFrame(signals)
+
+        # Count signals
+        signal_counts = self.signals["signal"].value_counts()
+        tradeable = self.signals[self.signals["signal"].isin(["LONG", "SHORT"])]
+
+        self.stats["signals_generated"] = len(tradeable)
+
+        print(f"  Signal distribution:")
+        for sig, count in signal_counts.items():
+            print(f"    {sig}: {count}")
+
+    def _step7_simulate_trades(self):
+        """Simulate trade execution with hit detection and P&L."""
+        print("\n[Step 7] Simulating trades...")
+
+        if self.signals is None or self.signals.empty:
+            return
+
+        # Get tradeable signals
+        tradeable = self.signals[self.signals["signal"].isin(["LONG", "SHORT"])].copy()
+
+        if tradeable.empty:
+            print("  No tradeable signals")
+            self.trades = pd.DataFrame()
+            return
+
+        # Load cost scenario (use medium for Phase 1)
+        cost_scenario = self.cost_config["scenarios"]["medium"]
+        total_cost_bps = (
+            cost_scenario["spread_bps_each_side"] +
+            cost_scenario["slippage_bps_each_side"] +
+            cost_scenario["commission_bps_each_side"]
+        ) * 2  # Entry + exit
+
+        print(f"  Cost scenario: medium ({total_cost_bps} bps round-trip)")
+
+        trades = []
+        for _, sig in tradeable.iterrows():
+            entry = sig["entry_price"]
+            target = sig["target_price"]
+            t2_high = sig["t2_high"]
+            t2_low = sig["t2_low"]
+            t2_close = sig["t2_close"]
+
+            if pd.isna(entry) or pd.isna(target):
+                continue
+
+            # Hit detection using T2 High/Low
+            if sig["signal"] == "LONG":
+                # Long: target is above entry, check if T2 high >= target
+                hit = t2_high >= target if not pd.isna(t2_high) else False
+                if hit:
+                    exit_price = target
+                else:
+                    exit_price = t2_close
+                gross_return = (exit_price - entry) / entry
+            else:  # SHORT
+                # Short: target is below entry, check if T2 low <= target
+                hit = t2_low <= target if not pd.isna(t2_low) else False
+                if hit:
+                    exit_price = target
+                else:
+                    exit_price = t2_close
+                gross_return = (entry - exit_price) / entry
+
+            # Apply costs
+            net_return = gross_return - (total_cost_bps / 10000)
+
+            trades.append({
+                "symbol": sig["symbol"],
+                "earnings_date": sig["earnings_date"],
+                "t2_date": sig["t2_date"],
+                "signal": sig["signal"],
+                "entry_price": entry,
+                "target_price": target,
+                "exit_price": exit_price,
+                "t2_high": t2_high,
+                "t2_low": t2_low,
+                "t2_close": t2_close,
+                "hit_target": hit,
+                "gross_return": gross_return,
+                "cost_bps": total_cost_bps,
+                "net_return": net_return,
+            })
+
+        self.trades = pd.DataFrame(trades)
+
+        if not self.trades.empty:
+            hits = self.trades["hit_target"].sum()
+            self.stats["trades_executed"] = len(self.trades)
+            self.stats["trades_hit_target"] = int(hits)
+            self.stats["hit_rate"] = float(hits / len(self.trades))
+            self.stats["avg_gross_return"] = float(self.trades["gross_return"].mean())
+            self.stats["avg_net_return"] = float(self.trades["net_return"].mean())
+
+            print(f"  Trades executed: {len(self.trades)}")
+            print(f"  Hit target: {hits} ({hits/len(self.trades):.1%})")
+            print(f"  Avg gross return: {self.trades['gross_return'].mean():.4f}")
+            print(f"  Avg net return: {self.trades['net_return'].mean():.4f}")
+
+    def _step8_export_csvs(self):
         """Export all data to CSVs."""
-        print("\n[Step 6] Exporting CSVs...")
+        print("\n[Step 8] Exporting CSVs...")
 
-        # Ensure export directory exists
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-
         exports = {}
 
-        # 1. S&P 500 constituents (sample for Phase 1)
+        # 1. S&P 500 constituents sample
         if self.sp500_constituents is not None and not self.sp500_constituents.empty:
             path = EXPORT_DIR / "phase_1__sp500_constituents_sample.csv"
             self.sp500_constituents.to_csv(path, index=False)
             exports["phase_1__sp500_constituents_sample.csv"] = len(self.sp500_constituents)
-            print(f"  Exported {path.name}: {len(self.sp500_constituents)} rows")
+            print(f"  {path.name}: {len(self.sp500_constituents)} rows")
 
         # 2. Earnings events
         if self.earnings_events is not None and not self.earnings_events.empty:
             path = EXPORT_DIR / "phase_1__earnings_events.csv"
             self.earnings_events.to_csv(path, index=False)
             exports["phase_1__earnings_events.csv"] = len(self.earnings_events)
-            print(f"  Exported {path.name}: {len(self.earnings_events)} rows")
+            print(f"  {path.name}: {len(self.earnings_events)} rows")
 
-        # 3. Daily OHLCV (only needed rows)
+        # 3. Daily OHLCV
         if self.daily_ohlcv is not None and not self.daily_ohlcv.empty:
             path = EXPORT_DIR / "phase_1__daily_ohlcv.csv"
             self.daily_ohlcv.to_csv(path, index=False)
             exports["phase_1__daily_ohlcv.csv"] = len(self.daily_ohlcv)
-            print(f"  Exported {path.name}: {len(self.daily_ohlcv)} rows")
+            print(f"  {path.name}: {len(self.daily_ohlcv)} rows")
 
-        # 4. Event windows
+        # 4. Event windows (with features)
         if self.event_windows is not None and not self.event_windows.empty:
             path = EXPORT_DIR / "phase_1__event_windows.csv"
             self.event_windows.to_csv(path, index=False)
             exports["phase_1__event_windows.csv"] = len(self.event_windows)
-            print(f"  Exported {path.name}: {len(self.event_windows)} rows")
+            print(f"  {path.name}: {len(self.event_windows)} rows")
 
-        # 5. Features
-        if self.features is not None and not self.features.empty:
+        # 5. Signals
+        if self.signals is not None and not self.signals.empty:
+            path = EXPORT_DIR / "phase_1__signals.csv"
+            self.signals.to_csv(path, index=False)
+            exports["phase_1__signals.csv"] = len(self.signals)
+            print(f"  {path.name}: {len(self.signals)} rows")
+
+        # 6. Trades
+        if self.trades is not None and not self.trades.empty:
+            path = EXPORT_DIR / "phase_1__trades.csv"
+            self.trades.to_csv(path, index=False)
+            exports["phase_1__trades.csv"] = len(self.trades)
+            print(f"  {path.name}: {len(self.trades)} rows")
+
+        # 7. Core features (for backward compatibility)
+        if self.event_windows is not None and not self.event_windows.empty:
+            features = self.event_windows[
+                [
+                    "symbol", "earnings_date", "session", "effective_session",
+                    "t0_date", "t1_date", "t2_date",
+                    "t0_close", "t1_close", "t2_open",
+                    "R1", "Gap2", "abs_R1", "abs_Gap2",
+                ]
+            ].copy()
             path = EXPORT_DIR / "phase_1__features_core.csv"
-            self.features.to_csv(path, index=False)
-            exports["phase_1__features_core.csv"] = len(self.features)
-            print(f"  Exported {path.name}: {len(self.features)} rows")
+            features.to_csv(path, index=False)
+            exports["phase_1__features_core.csv"] = len(features)
+            print(f"  {path.name}: {len(features)} rows")
 
         self.stats["exports"] = exports
 
@@ -343,15 +539,16 @@ class Phase1Pipeline:
         """Print final summary."""
         print("\nSummary:")
         print("-" * 40)
-        print(f"Selected tickers: {', '.join(self.tickers)}")
-        print(f"Total earnings events: {self.stats['total_earnings_events']}")
+        print(f"Tickers: {', '.join(self.tickers)}")
+        print(f"Earnings events: {self.stats['total_earnings_events']}")
+        print(f"Events with unknown session: {self.stats['events_with_unknown_session']}")
         print(f"Complete windows: {self.stats['complete_windows']}")
-        print(f"Missing T0: {self.stats['missing_t0']}")
-        print(f"Missing T1: {self.stats['missing_t1']}")
-        print(f"Missing T2: {self.stats['missing_t2']}")
-        print("\nExported files:")
-        for fname, rows in self.stats.get("exports", {}).items():
-            print(f"  {fname}: {rows} rows")
+        print(f"Signals generated: {self.stats['signals_generated']}")
+        print(f"Trades executed: {self.stats['trades_executed']}")
+        if self.stats['trades_executed'] > 0:
+            print(f"Hit rate: {self.stats.get('hit_rate', 0):.1%}")
+            print(f"Avg gross return: {self.stats.get('avg_gross_return', 0):.4f}")
+            print(f"Avg net return: {self.stats.get('avg_net_return', 0):.4f}")
 
 
 def main():

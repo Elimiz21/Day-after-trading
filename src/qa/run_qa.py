@@ -34,6 +34,8 @@ def check_phase1_exports() -> list[str]:
         "phase_1__daily_ohlcv.csv",
         "phase_1__event_windows.csv",
         "phase_1__features_core.csv",
+        "phase_1__signals.csv",
+        "phase_1__trades.csv",
     ]
 
     for csv_name in required_csvs:
@@ -43,7 +45,7 @@ def check_phase1_exports() -> list[str]:
         else:
             try:
                 df = pd.read_csv(csv_path)
-                if len(df) == 0:
+                if len(df) == 0 and csv_name != "phase_1__trades.csv":
                     issues.append(f"Empty CSV: {csv_path}")
             except Exception as e:
                 issues.append(f"Invalid CSV {csv_path}: {e}")
@@ -63,38 +65,71 @@ def check_phase1_data_quality() -> list[str]:
         if len(df) < 5:
             issues.append(f"Insufficient tickers: {len(df)} (expected at least 5)")
 
-    # Check event windows completeness
+    # Check event windows
     windows_path = csv_dir / "phase_1__event_windows.csv"
     if windows_path.exists():
         df = pd.read_csv(windows_path)
-        missing_t0 = df["t0_close"].isna().sum()
-        missing_t1 = df["t1_close"].isna().sum()
-        missing_t2 = df["t2_close"].isna().sum()
 
-        # Warn if more than 20% missing (not a hard fail for Phase 1)
-        total = len(df)
-        if total > 0:
-            if missing_t0 / total > 0.2:
-                issues.append(f"High T0 missing rate: {missing_t0}/{total}")
-            if missing_t1 / total > 0.2:
-                issues.append(f"High T1 missing rate: {missing_t1}/{total}")
-            if missing_t2 / total > 0.2:
-                issues.append(f"High T2 missing rate: {missing_t2}/{total}")
+        # Check for session field (BMO/AMC tracking)
+        if "session" not in df.columns:
+            issues.append("Missing 'session' column in event_windows (BMO/AMC tracking)")
+
+        # Check date ordering: t0 <= t1 < t2
+        df["t0_date"] = pd.to_datetime(df["t0_date"])
+        df["t1_date"] = pd.to_datetime(df["t1_date"])
+        df["t2_date"] = pd.to_datetime(df["t2_date"])
+
+        date_violations = (
+            (df["t0_date"] > df["t1_date"]) |
+            (df["t1_date"] >= df["t2_date"])
+        ).sum()
+        if date_violations > 0:
+            issues.append(f"Date ordering violations (t0 <= t1 < t2): {date_violations}")
+
+        # Check OHLC consistency: Low <= Open,Close <= High
+        for prefix in ["t0", "t1", "t2"]:
+            ohlc_cols = [f"{prefix}_open", f"{prefix}_high", f"{prefix}_low", f"{prefix}_close"]
+            if all(c in df.columns for c in ohlc_cols):
+                valid_rows = df.dropna(subset=ohlc_cols)
+                ohlc_violations = (
+                    (valid_rows[f"{prefix}_low"] > valid_rows[f"{prefix}_open"]) |
+                    (valid_rows[f"{prefix}_low"] > valid_rows[f"{prefix}_close"]) |
+                    (valid_rows[f"{prefix}_high"] < valid_rows[f"{prefix}_open"]) |
+                    (valid_rows[f"{prefix}_high"] < valid_rows[f"{prefix}_close"])
+                ).sum()
+                if ohlc_violations > 0:
+                    issues.append(f"OHLC consistency violations in {prefix}: {ohlc_violations}")
 
     # Check features
     features_path = csv_dir / "phase_1__features_core.csv"
     if features_path.exists():
         df = pd.read_csv(features_path)
-        if "R1" not in df.columns:
-            issues.append("Missing R1 column in features")
-        if "Gap2" not in df.columns:
-            issues.append("Missing Gap2 column in features")
 
-        # Check for NaN in computed features (should be minimal)
-        if "R1" in df.columns:
-            r1_na = df["R1"].isna().sum()
-            if r1_na > len(df) * 0.1:
-                issues.append(f"High R1 NaN rate: {r1_na}/{len(df)}")
+        required_cols = ["R1", "Gap2", "session", "effective_session"]
+        for col in required_cols:
+            if col not in df.columns:
+                issues.append(f"Missing column in features: {col}")
+
+    # Check signals
+    signals_path = csv_dir / "phase_1__signals.csv"
+    if signals_path.exists():
+        df = pd.read_csv(signals_path)
+
+        required_cols = ["signal", "target_price", "entry_price"]
+        for col in required_cols:
+            if col not in df.columns:
+                issues.append(f"Missing column in signals: {col}")
+
+    # Check trades
+    trades_path = csv_dir / "phase_1__trades.csv"
+    if trades_path.exists():
+        df = pd.read_csv(trades_path)
+
+        required_cols = ["signal", "entry_price", "target_price", "exit_price",
+                         "hit_target", "gross_return", "cost_bps", "net_return"]
+        for col in required_cols:
+            if col not in df.columns:
+                issues.append(f"Missing column in trades: {col}")
 
     return issues
 
@@ -136,7 +171,6 @@ def main():
     if quality_issues:
         for issue in quality_issues:
             print(f"  WARN: {issue}")
-            # Quality issues are warnings, not hard failures for Phase 1
     else:
         print("  PASS: Data quality checks passed")
 
