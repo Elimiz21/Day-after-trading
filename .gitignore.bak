@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+
+# Env / secrets
+.env
+
+# OS
+.DS_Store
+
+# Data (keep exports, ignore heavy intermediates)
+data/raw/
+data/processed/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Build
+dist/
+build/
