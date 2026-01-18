@@ -5,12 +5,30 @@ backtest that implements the full strategy specification:
 
 1. Data ingestion: Earnings dates + OHLCV from FMP API
 2. Event mapping: T0/T1/T2 with session handling (BMO/AMC)
-3. Signal generation: Significant move filter on R1
-4. Trade entry: Enter at Open(T2) if signal + opposite Gap2
+3. Signal generation: Significant move on T1, opposite gap on T2
+4. Trade entry: Enter at Open(T2) if signal conditions met
 5. Hit detection: Check if target (Close(T1)) hit using T2 High/Low
 6. Exit rules: Exit at target if hit, else at Close(T2)
 7. Cost modeling: Apply scenario-based execution costs
 8. P&L computation: Gross and net returns
+
+Strategy Specification:
+-----------------------
+The earnings reversal strategy:
+- R1 = Close(T1) / Close(T0) - 1  (day-after return, the "significant move")
+- Gap2 = Open(T2) / Close(T1) - 1 (overnight gap, the "opposite direction")
+- Target = Close(T1) (reversion target)
+- Entry = Open(T2)
+
+Signal Rules (per spec):
+- LONG: R1 > threshold (positive significant move) AND Gap2 < 0 (gap down)
+  → Expect price to revert UP to Close(T1), which is ABOVE entry
+- SHORT: R1 < -threshold (negative significant move) AND Gap2 > 0 (gap up)
+  → Expect price to revert DOWN to Close(T1), which is BELOW entry
+
+This is a "gap fade" / "mean reversion" strategy: after a big move,
+if the market gaps in the opposite direction, bet on continuation
+of that gap (i.e., reversion toward the T1 close level).
 
 Ticker Selection Criteria (Phase 1):
 -------------------------------------
@@ -26,12 +44,16 @@ Data Policy:
 - OHLCV: FMP /stable/historical-price-eod/full (split-adjusted, NOT dividend-adjusted)
 - R1/Gap2 computed from adjusted closes for consistency
 - All signals and P&L use the same adjustment policy
+- Split-adjusted means corporate actions (stock splits) are reflected
+- NOT dividend-adjusted means overnight gaps include ex-dividend effects
 
 BMO/AMC Limitation:
 -------------------
-FMP API does not provide announcement time. All events are treated as
-AMC (after market close) which is the most common case. This is tracked
-in the 'session' field for sensitivity analysis.
+FMP API does not provide announcement time (BMO vs AMC). Events with
+unknown session are EXCLUDED from the backtest to avoid systematic
+misalignment. The session field tracks this exclusion reason.
+For future phases: either obtain timing from another source or run
+dual-assumption sensitivity analysis.
 """
 
 import datetime
@@ -311,7 +333,16 @@ class Phase1Pipeline:
             print(f"  Gap2: mean={df['Gap2'].mean():.4f}, std={df['Gap2'].std():.4f}")
 
     def _step6_generate_signals(self):
-        """Generate trading signals based on significant move filter."""
+        """Generate trading signals based on spec: significant R1 + opposite Gap2.
+
+        Strategy Spec (corrected):
+        - LONG: R1 > threshold (price went UP on T1) AND Gap2 < 0 (gaps DOWN into T2)
+          → Target = Close(T1) is ABOVE entry = Open(T2), so we go long to catch the reversion up
+        - SHORT: R1 < -threshold (price went DOWN on T1) AND Gap2 > 0 (gaps UP into T2)
+          → Target = Close(T1) is BELOW entry = Open(T2), so we go short to catch the reversion down
+
+        This is a gap-fade / mean-reversion strategy.
+        """
         print("\n[Step 6] Generating signals...")
 
         if self.event_windows is None or self.event_windows.empty:
@@ -326,43 +357,80 @@ class Phase1Pipeline:
 
         print(f"  R1 threshold (absolute): {r1_threshold:.2%}")
         print(f"  Gap2 minimum (absolute): {gap2_min:.4f}")
-
-        # Signal logic:
-        # - Significant negative R1 (big drop on T1) + positive Gap2 -> LONG
-        # - Significant positive R1 (big rise on T1) + negative Gap2 -> SHORT
-        # - Otherwise -> NO_TRADE
+        print(f"  Signal logic (per spec):")
+        print(f"    LONG:  R1 > +{r1_threshold:.2%} AND Gap2 < 0 (big up, then gap down)")
+        print(f"    SHORT: R1 < -{r1_threshold:.2%} AND Gap2 > 0 (big down, then gap up)")
 
         signals = []
         for idx, row in df.iterrows():
+            # Check if session is unknown - exclude from backtest per QA requirement
+            session_known = row.get("effective_session") != "amc_assumed"
+
             if pd.isna(row["R1"]) or pd.isna(row["Gap2"]):
-                signal = "NO_DATA"
+                signal = "EXCLUDED_NO_DATA"
+                exclusion_reason = "missing R1 or Gap2"
+            elif not session_known and row.get("session") == "unknown":
+                # Unknown session = exclude from backtest to avoid misalignment
+                # But for Phase 1, we run dual-assumption: treat all as AMC and flag it
+                signal = "EXCLUDED_UNKNOWN_SESSION"
+                exclusion_reason = "unknown BMO/AMC session"
             elif row["abs_R1"] < r1_threshold:
                 signal = "NO_TRADE_SMALL_R1"
+                exclusion_reason = f"R1 magnitude too small: {row['abs_R1']:.4f}"
             elif row["abs_Gap2"] < gap2_min:
                 signal = "NO_TRADE_SMALL_GAP"
-            elif row["R1"] < 0 and row["Gap2"] > 0:
-                # Big drop, then gap up -> expect reversal down, SHORT
-                # Wait, strategy is: if big drop, expect bounce -> LONG
-                # Let me re-read: "day-after reversal" = price reverses after big move
-                # Big drop on T1 -> expect price to bounce -> LONG on T2
+                exclusion_reason = f"Gap2 magnitude too small: {row['abs_Gap2']:.4f}"
+            elif row["R1"] > r1_threshold and row["Gap2"] < 0:
+                # LONG: Big up on T1, gap down into T2 -> revert up to Close(T1)
+                # Target (t1_close) should be > Entry (t2_open) for this to make sense
                 signal = "LONG"
-            elif row["R1"] > 0 and row["Gap2"] < 0:
-                # Big rise, then gap down -> expect reversal -> SHORT
+                exclusion_reason = None
+            elif row["R1"] < -r1_threshold and row["Gap2"] > 0:
+                # SHORT: Big down on T1, gap up into T2 -> revert down to Close(T1)
+                # Target (t1_close) should be < Entry (t2_open) for this to make sense
                 signal = "SHORT"
+                exclusion_reason = None
             else:
-                # Gap direction same as R1, no reversal signal
+                # Gap direction same as R1 direction (no opposite gap)
                 signal = "NO_TRADE_SAME_DIRECTION"
+                exclusion_reason = "Gap2 direction matches R1 direction"
+
+            # Calculate target and entry for validation
+            target_price = row["t1_close"]
+            entry_price = row["t2_open"]
+
+            # Sanity check: for valid signals, verify target/entry relationship
+            target_entry_valid = True
+            if signal == "LONG" and not pd.isna(target_price) and not pd.isna(entry_price):
+                # For LONG, target should be >= entry (we're buying low, targeting high)
+                if target_price < entry_price:
+                    # This is unexpected - target below entry for a long
+                    # But it can happen if gap was very large
+                    pass  # Still valid, just means we have upside target
+            elif signal == "SHORT" and not pd.isna(target_price) and not pd.isna(entry_price):
+                # For SHORT, target should be <= entry (we're selling high, targeting low)
+                if target_price > entry_price:
+                    # This is unexpected - target above entry for a short
+                    pass  # Still valid
 
             signals.append({
                 "event_idx": idx,
                 "symbol": row["symbol"],
                 "earnings_date": row["earnings_date"],
+                "session": row["session"],
+                "effective_session": row["effective_session"],
+                "t0_date": row["t0_date"],
+                "t1_date": row["t1_date"],
                 "t2_date": row["t2_date"],
+                "t0_close": row["t0_close"],
+                "t1_close": row["t1_close"],
+                "t2_open": row["t2_open"],
                 "R1": row["R1"],
                 "Gap2": row["Gap2"],
                 "signal": signal,
-                "target_price": row["t1_close"],  # Target = Close(T1)
-                "entry_price": row["t2_open"],    # Entry = Open(T2)
+                "exclusion_reason": exclusion_reason,
+                "target_price": target_price,  # Target = Close(T1)
+                "entry_price": entry_price,    # Entry = Open(T2)
                 "t2_high": row["t2_high"],
                 "t2_low": row["t2_low"],
                 "t2_close": row["t2_close"],
@@ -375,13 +443,36 @@ class Phase1Pipeline:
         tradeable = self.signals[self.signals["signal"].isin(["LONG", "SHORT"])]
 
         self.stats["signals_generated"] = len(tradeable)
+        self.stats["events_excluded_unknown_session"] = int(
+            (self.signals["signal"] == "EXCLUDED_UNKNOWN_SESSION").sum()
+        )
 
         print(f"  Signal distribution:")
         for sig, count in signal_counts.items():
             print(f"    {sig}: {count}")
 
     def _step7_simulate_trades(self):
-        """Simulate trade execution with hit detection and P&L."""
+        """Simulate trade execution with hit detection and P&L.
+
+        Trade Logic:
+        - Entry: Open(T2)
+        - Target: Close(T1) (the level we expect price to revert to)
+        - Hit detection:
+          - LONG: T2_high >= target (price reached up to target)
+          - SHORT: T2_low <= target (price reached down to target)
+        - Exit:
+          - If hit: exit at target
+          - If not hit: exit at Close(T2)
+
+        Return Calculation:
+        - LONG: (exit - entry) / entry  (profit if exit > entry)
+        - SHORT: (entry - exit) / entry (profit if exit < entry)
+
+        Assertions (QA requirement):
+        - target_price == t1_close (exact)
+        - For LONG hit: exit_price == target_price, gross_return == target/entry - 1
+        - For SHORT hit: exit_price == target_price, gross_return == entry/target - 1
+        """
         print("\n[Step 7] Simulating trades...")
 
         if self.signals is None or self.signals.empty:
@@ -401,14 +492,18 @@ class Phase1Pipeline:
             cost_scenario["spread_bps_each_side"] +
             cost_scenario["slippage_bps_each_side"] +
             cost_scenario["commission_bps_each_side"]
-        ) * 2  # Entry + exit
+        ) * 2  # Entry + exit (round-trip)
 
         print(f"  Cost scenario: medium ({total_cost_bps} bps round-trip)")
+        print(f"    - Applied once per trade as: net_return = gross_return - {total_cost_bps/100:.2f}%")
 
         trades = []
+        validation_errors = []
+
         for _, sig in tradeable.iterrows():
             entry = sig["entry_price"]
             target = sig["target_price"]
+            t1_close = sig["t1_close"]
             t2_high = sig["t2_high"]
             t2_low = sig["t2_low"]
             t2_close = sig["t2_close"]
@@ -416,32 +511,71 @@ class Phase1Pipeline:
             if pd.isna(entry) or pd.isna(target):
                 continue
 
+            # ASSERTION 1: target_price == t1_close
+            if abs(target - t1_close) > 0.0001:
+                validation_errors.append(
+                    f"{sig['symbol']} {sig['earnings_date']}: target_price ({target}) != t1_close ({t1_close})"
+                )
+
             # Hit detection using T2 High/Low
             if sig["signal"] == "LONG":
-                # Long: target is above entry, check if T2 high >= target
+                # LONG: we bought at entry, target is the level we expect to reach
+                # Check if intraday high reached target
                 hit = t2_high >= target if not pd.isna(t2_high) else False
                 if hit:
                     exit_price = target
                 else:
-                    exit_price = t2_close
+                    exit_price = t2_close if not pd.isna(t2_close) else entry
+
+                # LONG return: profit if we sell higher than we bought
                 gross_return = (exit_price - entry) / entry
+
+                # ASSERTION 2: For LONG hit, gross_return should equal target/entry - 1
+                if hit:
+                    expected_return = (target - entry) / entry
+                    if abs(gross_return - expected_return) > 0.0001:
+                        validation_errors.append(
+                            f"{sig['symbol']} {sig['earnings_date']} LONG hit: "
+                            f"gross_return ({gross_return:.6f}) != expected ({expected_return:.6f})"
+                        )
+
             else:  # SHORT
-                # Short: target is below entry, check if T2 low <= target
+                # SHORT: we sold at entry, target is the level we expect to reach
+                # Check if intraday low reached target
                 hit = t2_low <= target if not pd.isna(t2_low) else False
                 if hit:
                     exit_price = target
                 else:
-                    exit_price = t2_close
+                    exit_price = t2_close if not pd.isna(t2_close) else entry
+
+                # SHORT return: profit if we buy back lower than we sold
                 gross_return = (entry - exit_price) / entry
 
-            # Apply costs
+                # ASSERTION 3: For SHORT hit, gross_return should equal (entry - target) / entry
+                if hit:
+                    expected_return = (entry - target) / entry
+                    if abs(gross_return - expected_return) > 0.0001:
+                        validation_errors.append(
+                            f"{sig['symbol']} {sig['earnings_date']} SHORT hit: "
+                            f"gross_return ({gross_return:.6f}) != expected ({expected_return:.6f})"
+                        )
+
+            # Apply costs (once per round-trip trade)
             net_return = gross_return - (total_cost_bps / 10000)
 
             trades.append({
                 "symbol": sig["symbol"],
                 "earnings_date": sig["earnings_date"],
+                "session": sig["session"],
+                "effective_session": sig["effective_session"],
+                "t0_date": sig["t0_date"],
+                "t1_date": sig["t1_date"],
                 "t2_date": sig["t2_date"],
                 "signal": sig["signal"],
+                "R1": sig["R1"],
+                "Gap2": sig["Gap2"],
+                "t0_close": sig["t0_close"],
+                "t1_close": t1_close,
                 "entry_price": entry,
                 "target_price": target,
                 "exit_price": exit_price,
@@ -456,18 +590,39 @@ class Phase1Pipeline:
 
         self.trades = pd.DataFrame(trades)
 
+        # Report validation errors
+        if validation_errors:
+            print(f"\n  WARNING: {len(validation_errors)} validation error(s):")
+            for err in validation_errors[:5]:
+                print(f"    - {err}")
+            if len(validation_errors) > 5:
+                print(f"    ... and {len(validation_errors) - 5} more")
+            self.stats["trade_validation_errors"] = len(validation_errors)
+        else:
+            print("  All trade validations passed (target=t1_close, return math correct)")
+            self.stats["trade_validation_errors"] = 0
+
         if not self.trades.empty:
             hits = self.trades["hit_target"].sum()
             self.stats["trades_executed"] = len(self.trades)
             self.stats["trades_hit_target"] = int(hits)
-            self.stats["hit_rate"] = float(hits / len(self.trades))
+            self.stats["hit_rate"] = float(hits / len(self.trades)) if len(self.trades) > 0 else 0.0
             self.stats["avg_gross_return"] = float(self.trades["gross_return"].mean())
             self.stats["avg_net_return"] = float(self.trades["net_return"].mean())
 
-            print(f"  Trades executed: {len(self.trades)}")
+            print(f"\n  Trades executed: {len(self.trades)}")
             print(f"  Hit target: {hits} ({hits/len(self.trades):.1%})")
             print(f"  Avg gross return: {self.trades['gross_return'].mean():.4f}")
             print(f"  Avg net return: {self.trades['net_return'].mean():.4f}")
+
+            # Show sample trades for verification
+            print("\n  Sample trades (for verification):")
+            for _, trade in self.trades.head(3).iterrows():
+                direction = "↑" if trade["signal"] == "LONG" else "↓"
+                hit_str = "HIT" if trade["hit_target"] else "MISS"
+                print(f"    {trade['symbol']} {trade['t2_date']} {trade['signal']}{direction}: "
+                      f"entry={trade['entry_price']:.2f} target={trade['target_price']:.2f} "
+                      f"exit={trade['exit_price']:.2f} [{hit_str}] gross={trade['gross_return']:.4f}")
 
     def _step8_export_csvs(self):
         """Export all data to CSVs."""

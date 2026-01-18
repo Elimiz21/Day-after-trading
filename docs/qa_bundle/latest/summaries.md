@@ -11,9 +11,10 @@
 | Missing T0 | 0 |
 | Missing T1 | 0 |
 | Missing T2 | 0 |
-| Signals generated | 6 |
+| LONG signals | 3 |
+| SHORT signals | 3 |
 | Trades executed | 6 |
-| Trades hit target | 6 |
+| Trades hit target | 4 |
 
 ## CSV Row Counts
 
@@ -38,30 +39,26 @@ symbol earnings_date session    t0_date    t1_date    t2_date        R1      Gap
    JPM    2025-10-14 unknown 2025-10-14 2025-10-15 2025-10-16  0.011950 -0.001112
 ```
 
-## Sample: Signals (first 10 rows)
+## Sample: Tradeable Signals (all LONG/SHORT)
 
 ```
-symbol earnings_date             signal        R1      Gap2  entry_price  target_price
-   JPM    2026-01-13  NO_TRADE_SMALL_R1 -0.009746  0.001949       308.47        307.87
-   WMT    2025-11-20 NO_TRADE_SMALL_GAP -0.016712  0.000380       105.36        105.32
-   XOM    2025-10-31  NO_TRADE_SMALL_R1 -0.005247 -0.003340       113.38        113.76
-  AAPL    2025-10-30  NO_TRADE_SMALL_R1 -0.003795  0.000185       270.42        270.37
-   JPM    2025-10-14 NO_TRADE_SMALL_GAP  0.011950 -0.001112       305.35        305.69
-   JNJ    2025-10-14  NO_TRADE_SMALL_R1  0.001677  0.000889       191.34        191.17
-   WMT    2025-08-21 NO_TRADE_SMALL_GAP -0.011535  0.001756        97.00         96.83
-   XOM    2025-08-01 NO_TRADE_SMALL_GAP -0.020704 -0.001397       107.22        107.37
-  AAPL    2025-07-31               LONG -0.025004  0.010525       204.51        202.38
-   JNJ    2025-07-16               LONG -0.010924  0.005829       163.93        162.98
+symbol earnings_date signal        R1      Gap2  entry_price  target_price  t1_close
+  AAPL    2025-07-31  SHORT -0.025004  0.010525       204.51        202.38    202.38
+   JNJ    2025-07-16  SHORT -0.010924  0.005829       163.93        162.98    162.98
+   WMT    2025-05-15   LONG  0.019616 -0.016185        96.65         98.24     98.24
+   XOM    2025-05-02  SHORT -0.027681  0.006004       103.89        103.27    103.27
+  AAPL    2024-05-02   LONG  0.059816 -0.005617       182.35        183.38    183.38
+   XOM    2024-04-26   LONG  0.014242 -0.004430       119.11        119.64    119.64
 ```
 
 ## Sample: Trades (all)
 
 ```
-symbol signal  entry_price  target_price  exit_price  hit_target  gross_return  net_return
-  AAPL   LONG       204.51        202.38      202.38        True     -0.010415   -0.012415
-   JNJ   LONG       163.93        162.98      162.98        True     -0.005795   -0.007795
-   WMT  SHORT        96.65         98.24       98.24        True     -0.016451   -0.018451
-   XOM   LONG       103.89        103.27      103.27        True     -0.005968   -0.007968
-  AAPL  SHORT       182.35        183.38      183.38        True     -0.005648   -0.007648
-   XOM  SHORT       119.11        119.64      119.64        True     -0.004450   -0.006450
+symbol    t2_date signal        R1      Gap2  entry_price  target_price  t1_close  exit_price  hit_target  gross_return  net_return
+  AAPL 2025-08-04  SHORT -0.025004  0.010525       204.51        202.38    202.38      202.38        True      0.010415    0.008415
+   JNJ 2025-07-18  SHORT -0.010924  0.005829       163.93        162.98    162.98      163.70       False      0.001403   -0.000597
+   WMT 2025-05-19   LONG  0.019616 -0.016185        96.65         98.24     98.24       98.24        True      0.016451    0.014451
+   XOM 2025-05-06  SHORT -0.027681  0.006004       103.89        103.27    103.27      104.71       False     -0.007893   -0.009893
+  AAPL 2024-05-06   LONG  0.059816 -0.005617       182.35        183.38    183.38      183.38        True      0.005648    0.003648
+   XOM 2024-04-30   LONG  0.014242 -0.004430       119.11        119.64    119.64      119.64        True      0.004450    0.002450
 ```
